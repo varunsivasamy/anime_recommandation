@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Core recommender module (CorrectAnimeRecommender).
-Depends on artifacts saved by CorrectAnimeTrainer in `model_dir`."""
+Uses Pinecone for cloud-based vector search."""
 import os
 import ast
 import time
@@ -13,18 +13,19 @@ import numpy as np
 import pandas as pd
 import joblib
 from sentence_transformers import SentenceTransformer
-import faiss
+from pinecone import Pinecone
+from dotenv import load_dotenv
 
+load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 class CorrectAnimeRecommender:
-    """Semantically-correct hybrid recommender.
+    """Semantically-correct hybrid recommender using Pinecone.
     Expects these files in `model_dir`:
     - anime_processed.csv
-    - embeddings.npy
-    - faiss_index.bin
+    - embeddings.npy (for local fallback)
     - encoders.pkl  (contains 'tfidf_vectorizer')
     - tfidf_matrix.npy"""
 
@@ -34,8 +35,9 @@ class CorrectAnimeRecommender:
         self.tfidf_vectorizer = None
         self.df: Optional[pd.DataFrame] = None
         self.embeddings: Optional[np.ndarray] = None
-        self.faiss_index = None
         self.tfidf_matrix: Optional[np.ndarray] = None
+        self.pc = None
+        self.index = None
 
         # stats + cache
         self.stats = {"total_queries": 0, "avg_response_time": 0.0, "cache_hits": 0}
@@ -45,8 +47,24 @@ class CorrectAnimeRecommender:
         # simple in-memory user history for personalization
         self.user_history: Dict[str, Dict] = {}
 
-        if os.path.exists(os.path.join(model_dir, "embeddings.npy")):
-            self._load_artifacts()
+        self._load_artifacts()
+        self._init_pinecone()
+
+    def _init_pinecone(self):
+        """Initialize Pinecone connection"""
+        api_key = os.getenv("PINECONE_API_KEY")
+        if not api_key:
+            logger.warning("PINECONE_API_KEY not found. Using local embeddings only.")
+            return
+        
+        try:
+            self.pc = Pinecone(api_key=api_key)
+            index_name = os.getenv("PINECONE_INDEX_NAME", "anime-recommender")
+            self.index = self.pc.Index(index_name)
+            logger.info(f"Connected to Pinecone index: {index_name}")
+        except Exception as e:
+            logger.error(f"Failed to connect to Pinecone: {e}")
+            self.index = None
 
     def _safe_parse_list(self, x):
         # robust parsing for lists from csv
@@ -88,27 +106,19 @@ class CorrectAnimeRecommender:
             if col in self.df.columns:
                 self.df[col] = self.df[col].apply(self._safe_parse_list)
 
-        # embeddings
+        # embeddings (for local fallback and personalization)
         emb_path = os.path.join(self.model_dir, "embeddings.npy")
-        self.embeddings = np.load(emb_path).astype(np.float32)
-        if self.df.shape[0] != self.embeddings.shape[0]:
-            raise RuntimeError("Data / embeddings length mismatch - rebuild artifacts")
+        if os.path.exists(emb_path):
+            self.embeddings = np.load(emb_path).astype(np.float32)
+            if self.df.shape[0] != self.embeddings.shape[0]:
+                raise RuntimeError("Data / embeddings length mismatch - rebuild artifacts")
 
-        # normalize
-        norms = np.linalg.norm(self.embeddings, axis=1, keepdims=True)
-        norms[norms == 0] = 1e-9
-        self.embeddings = self.embeddings / norms
-
-        # faiss
-        try:
-            self.faiss_index = faiss.read_index(os.path.join(self.model_dir, "faiss_index.bin"))
-            if self.faiss_index.metric_type != faiss.METRIC_INNER_PRODUCT:
-                logger.warning("FAISS metric not IP; building fallback flat index")
-                raise ValueError("wrong metric")
-        except Exception:
-            dim = self.embeddings.shape[1]
-            self.faiss_index = faiss.IndexFlatIP(dim)
-            self.faiss_index.add(self.embeddings)
+            # normalize
+            norms = np.linalg.norm(self.embeddings, axis=1, keepdims=True)
+            norms[norms == 0] = 1e-9
+            self.embeddings = self.embeddings / norms
+        else:
+            logger.warning("Local embeddings not found. Pinecone-only mode.")
 
         # tfidf
         enc_path = os.path.join(self.model_dir, "encoders.pkl")
@@ -168,16 +178,41 @@ class CorrectAnimeRecommender:
         return enhanced, detected_genres, detected_moods, year_filter
 
     # ---------------- Search & re-rank ----------------
-    def _search_faiss(self, query_vector: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-        if self.faiss_index is None or getattr(self.faiss_index, "ntotal", 0) == 0:
+    def _search_pinecone(self, query_vector: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Search using Pinecone"""
+        if self.index is None:
+            logger.warning("Pinecone not available, using local fallback")
+            return self._search_local(query_vector, k)
+        
+        try:
+            results = self.index.query(
+                vector=query_vector.tolist(),
+                top_k=k,
+                include_metadata=True
+            )
+            
+            if not results.matches:
+                return np.array([]), np.array([])
+            
+            scores = np.array([match.score for match in results.matches])
+            ids = np.array([int(match.id) for match in results.matches])
+            
+            return scores, ids
+        except Exception as e:
+            logger.error(f"Pinecone search failed: {e}")
+            return self._search_local(query_vector, k)
+    
+    def _search_local(self, query_vector: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Fallback local search using numpy"""
+        if self.embeddings is None:
             return np.array([]), np.array([])
-        q = query_vector.reshape(1, -1).astype(np.float32)
-        k = min(k, self.faiss_index.ntotal)
-        sims, idxs = self.faiss_index.search(q, k)
-        sims = sims[0]
-        idxs = idxs[0]
-        valid = idxs != -1
-        return sims[valid], idxs[valid]
+        
+        # Cosine similarity
+        similarities = np.dot(self.embeddings, query_vector)
+        top_k_idx = np.argsort(similarities)[::-1][:k]
+        top_k_scores = similarities[top_k_idx]
+        
+        return top_k_scores, top_k_idx
 
     def adaptive_tfidf_weight(self, query_text: str) -> float:
         t = len(query_text.split())
@@ -323,7 +358,7 @@ class CorrectAnimeRecommender:
                 self.query_cache.popitem(last=False)
 
         candidates_k = max(200, k * 10)
-        sims, idxs = self._search_faiss(qvec, candidates_k)
+        sims, idxs = self._search_pinecone(qvec, candidates_k)
         if sims.size == 0:
             return []
 
@@ -368,5 +403,6 @@ class CorrectAnimeRecommender:
             "cache_hits": self.stats["cache_hits"],
             "cache_hit_rate": round(hit_rate, 3),
             "avg_response_time": round(self.stats["avg_response_time"], 3),
-            "model_status": "loaded" if self.faiss_index is not None else "not_loaded"
+            "pinecone_status": "connected" if self.index is not None else "not_connected",
+            "model_status": "loaded"
         }

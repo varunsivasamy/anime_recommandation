@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Trainer: builds semantic_text, embeddings, TF-IDF, FAISS index and saves artifacts."""
+"""Trainer: builds semantic_text, embeddings, TF-IDF, and uploads to Pinecone."""
 import os
 import logging
 import numpy as np
@@ -7,9 +7,12 @@ import pandas as pd
 from typing import Tuple
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
-import faiss
 import joblib
+from pinecone import Pinecone, ServerlessSpec
+from dotenv import load_dotenv
+import time
 
+load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -19,6 +22,36 @@ class CorrectAnimeTrainer:
         self.model_dir = model_dir
         self.sentence_model = SentenceTransformer("all-mpnet-base-v2")
         self.df = None
+        self.pc = None
+        self.index = None
+        self._init_pinecone()
+
+    def _init_pinecone(self):
+        """Initialize Pinecone connection"""
+        api_key = os.getenv("PINECONE_API_KEY")
+        if not api_key:
+            logger.warning("PINECONE_API_KEY not found. Pinecone features disabled.")
+            return
+        
+        self.pc = Pinecone(api_key=api_key)
+        index_name = os.getenv("PINECONE_INDEX_NAME", "anime-recommender")
+        
+        # Check if index exists, create if not
+        existing_indexes = [idx.name for idx in self.pc.list_indexes()]
+        if index_name not in existing_indexes:
+            logger.info(f"Creating Pinecone index: {index_name}")
+            self.pc.create_index(
+                name=index_name,
+                dimension=768,  # all-mpnet-base-v2 dimension
+                metric="cosine",
+                spec=ServerlessSpec(cloud="aws", region="us-east-1")
+            )
+            # Wait for index to be ready
+            while not self.pc.describe_index(index_name).status['ready']:
+                time.sleep(1)
+        
+        self.index = self.pc.Index(index_name)
+        logger.info(f"Connected to Pinecone index: {index_name}")
 
     def parse_categories(self, s):
         if pd.isna(s) or not s:
@@ -112,16 +145,45 @@ class CorrectAnimeTrainer:
         )
         return emb.astype(np.float32)
 
-    def build_faiss(self, embeddings: np.ndarray):
-        d = embeddings.shape[1]
-        try:
-            index = faiss.IndexHNSWFlat(d, 32, faiss.METRIC_INNER_PRODUCT)
-            index.hnsw.efConstruction = 200
-            index.add(embeddings)
-        except Exception:
-            index = faiss.IndexFlatIP(d)
-            index.add(embeddings)
-        return index
+    def upload_to_pinecone(self, embeddings: np.ndarray):
+        """Upload embeddings to Pinecone in batches"""
+        if self.index is None:
+            logger.warning("Pinecone not initialized. Skipping upload.")
+            return
+        
+        logger.info("Uploading embeddings to Pinecone...")
+        batch_size = 100
+        vectors = []
+        
+        for idx in range(len(embeddings)):
+            # Create metadata for each anime
+            metadata = {
+                "name": str(self.df.iloc[idx]["Name"]),
+                "rank": int(self.df.iloc[idx].get("Rank", 0)),
+                "rating": float(self.df.iloc[idx].get("Rating", 0.0)),
+                "year": int(self.df.iloc[idx].get("Release_year", 0)),
+                "type": str(self.df.iloc[idx].get("Type", "")),
+                "studio": str(self.df.iloc[idx].get("Studio", ""))[:100],
+                "genres": str(self.df.iloc[idx].get("Tags", ""))[:200],
+            }
+            
+            vectors.append({
+                "id": str(idx),
+                "values": embeddings[idx].tolist(),
+                "metadata": metadata
+            })
+            
+            # Upload in batches
+            if len(vectors) >= batch_size:
+                self.index.upsert(vectors=vectors)
+                vectors = []
+                logger.info(f"Uploaded {idx + 1}/{len(embeddings)} vectors")
+        
+        # Upload remaining vectors
+        if vectors:
+            self.index.upsert(vectors=vectors)
+        
+        logger.info(f"Successfully uploaded {len(embeddings)} vectors to Pinecone")
 
     def create_tfidf(self) -> Tuple[object, np.ndarray]:
         tf = TfidfVectorizer(
@@ -136,12 +198,11 @@ class CorrectAnimeTrainer:
 
         return tf, mat
 
-    def save_artifacts(self, embeddings, faiss_index, tfidf_vectorizer, tfidf_matrix):
+    def save_artifacts(self, embeddings, tfidf_vectorizer, tfidf_matrix):
         os.makedirs(self.model_dir, exist_ok=True)
 
         self.df.to_csv(os.path.join(self.model_dir, "anime_processed.csv"), index=False)
         np.save(os.path.join(self.model_dir, "embeddings.npy"), embeddings)
-        faiss.write_index(faiss_index, os.path.join(self.model_dir, "faiss_index.bin"))
         np.save(os.path.join(self.model_dir, "tfidf_matrix.npy"), tfidf_matrix)
         joblib.dump(
             {"tfidf_vectorizer": tfidf_vectorizer},
@@ -153,9 +214,13 @@ class CorrectAnimeTrainer:
     def train(self, data_path: str = "Anime.csv"):
         self.preprocess(data_path)
         embeddings = self.create_embeddings()
-        index = self.build_faiss(embeddings)
         tfidf_vectorizer, tfidf_matrix = self.create_tfidf()
-        self.save_artifacts(embeddings, index, tfidf_vectorizer, tfidf_matrix)
+        
+        # Upload to Pinecone
+        self.upload_to_pinecone(embeddings)
+        
+        # Save local artifacts
+        self.save_artifacts(embeddings, tfidf_vectorizer, tfidf_matrix)
         logger.info("Training completed")
 
 
