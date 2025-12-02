@@ -101,8 +101,8 @@ class CorrectAnimeRecommender:
             raise FileNotFoundError(df_path)
         self.df = pd.read_csv(df_path)
 
-        # parse list-like columns
-        for col in ["genre_list", "theme_list", "mood_tags"]:
+        # parse list-like columns (theme_list doesn't exist in dataset)
+        for col in ["genre_list", "mood_tags"]:
             if col in self.df.columns:
                 self.df[col] = self.df[col].apply(self._safe_parse_list)
 
@@ -137,16 +137,50 @@ class CorrectAnimeRecommender:
 
     # ---------------- Query building and expansion ----------------
     def build_semantic_query(self, query: str) -> str:
+        """Build query matching dataset embedding structure for better alignment"""
         q = query.lower().strip()
-        parts = [f"anime about {query}"]
-        if "dark" in q:
-            parts.append("mood dark psychological mature serious")
-        if "sad" in q:
-            parts.append("mood emotional tragic touching tearjerker")
+        
+        # Extract genre hints from query
+        genre_hints = []
+        mood_hints = []
+        
+        if "demon" in q or "demons" in q:
+            genre_hints.extend(["demons", "supernatural", "dark fantasy", "battle", "shounen"])
+            mood_hints.append("dark")
+        if "dark" in q or "psychological" in q:
+            genre_hints.extend(["psychological", "thriller"])
+            mood_hints.extend(["dark", "mature", "serious"])
+        if "sad" in q or "emotional" in q:
+            genre_hints.append("drama")
+            mood_hints.extend(["emotional", "tragic", "heartbreaking"])
         if "romance" in q or "love" in q:
-            parts.append("genre romance love relationship romantic")
-        if "action" in q:
-            parts.append("genre action battle fight intense")
+            genre_hints.extend(["romance", "shoujo"])
+            mood_hints.extend(["romantic", "emotional"])
+        if "action" in q or "fight" in q:
+            genre_hints.extend(["action", "martial arts", "swordplay", "shounen"])
+            mood_hints.append("intense")
+        if "comedy" in q or "funny" in q:
+            genre_hints.extend(["comedy", "slice of life"])
+            mood_hints.extend(["funny", "lighthearted"])
+        if "school" in q:
+            genre_hints.extend(["school", "slice of life"])
+        if "fantasy" in q:
+            genre_hints.extend(["fantasy", "magic", "adventure"])
+        if "historical" in q:
+            genre_hints.extend(["historical", "period drama", "samurai"])
+        
+        # Match dataset embedding structure
+        parts = [
+            f"Title: anime about {query}",
+            f"Synopsis: {query}",
+        ]
+        
+        if genre_hints:
+            parts.append(f"Genres: {' '.join(genre_hints)}")
+        
+        if mood_hints:
+            parts.append(f"Mood: {' '.join(mood_hints)}")
+        
         return " | ".join(parts)
 
     def enhance_query(self, query_text: str) -> Tuple[str, List[str], List[str], Optional[int]]:
@@ -179,23 +213,36 @@ class CorrectAnimeRecommender:
 
     # ---------------- Search & re-rank ----------------
     def _search_pinecone(self, query_vector: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Search using Pinecone"""
+        """Search using Pinecone with quality filtering"""
         if self.index is None:
             logger.warning("Pinecone not available, using local fallback")
             return self._search_local(query_vector, k)
         
         try:
+            # Use metadata filtering to remove low-quality anime
+            # Safe cast to Python floats for precision
             results = self.index.query(
-                vector=query_vector.tolist(),
+                vector=[float(x) for x in query_vector],
                 top_k=k,
-                include_metadata=True
+                include_metadata=True,
+                filter={"rating": {"$gte": 3.5}}
             )
             
             if not results.matches:
                 return np.array([]), np.array([])
             
-            scores = np.array([match.score for match in results.matches])
-            ids = np.array([int(match.id) for match in results.matches])
+            # Safe ID parsing - filter out invalid IDs
+            valid_matches = [
+                (match.score, int(match.id))
+                for match in results.matches
+                if match.id.isdigit() and int(match.id) < len(self.df)
+            ]
+            
+            if not valid_matches:
+                return np.array([]), np.array([])
+            
+            scores = np.array([score for score, _ in valid_matches])
+            ids = np.array([idx for _, idx in valid_matches])
             
             return scores, ids
         except Exception as e:
@@ -216,11 +263,12 @@ class CorrectAnimeRecommender:
 
     def adaptive_tfidf_weight(self, query_text: str) -> float:
         t = len(query_text.split())
-        if t < 3:
-            return 0.0
-        if t >= 4:
-            return 0.15
-        return 0.10
+        if t <= 2:
+            return 0.05
+        elif t <= 4:
+            return 0.10
+        else:
+            return 0.20
 
     def rerank(self, query_text: str, candidates: List[int], similarities: np.ndarray,
                detected_genres: List[str], detected_moods: List[str], year_filter: Optional[int]) -> List[Tuple[int, float]]:
@@ -242,25 +290,32 @@ class CorrectAnimeRecommender:
                 tfidf_sim = float(np.dot(query_tfidf, self.tfidf_matrix[idx]))
 
             quality = float(row.get("quality_score", 0.5))
-            sem_w = 0.8 if tfidf_w == 0 else 0.78
-            quality_w = 0.2
-            final = sem_w * float(sem_sim) + tfidf_w * float(tfidf_sim) + quality_w * quality
+            
+            # Strict weight normalization (guarantees sum = 1.0)
+            base_sem_w = 0.85
+            quality_w = 0.08
+            scale = base_sem_w + tfidf_w + quality_w
+            sem_w = base_sem_w / scale
+            tfidf_w_norm = tfidf_w / scale
+            quality_w_norm = quality_w / scale
+            
+            final = sem_w * float(sem_sim) + tfidf_w_norm * float(tfidf_sim) + quality_w_norm * quality
 
-            # soft boosts
+            # Multiplicative boosts (safe, maintains probability space)
             if detected_genres:
                 anime_genres = [g.lower() for g in row.get("genre_list", [])]
                 if any(g in anime_genres for g in detected_genres):
-                    final += 0.05
+                    final *= 1.05
             if detected_moods:
                 anime_moods = [m.lower() for m in row.get("mood_tags", [])]
                 if any(m in anime_moods for m in detected_moods):
-                    final += 0.05
+                    final *= 1.05
             if year_filter is not None:
-                yr = int(row.get("Release_year", 0))
-                if year_filter == 2005 and yr <= 2005:
-                    final += 0.05
-                if year_filter == 2019 and yr >= 2019:
-                    final += 0.05
+                yr = int(pd.to_numeric(row.get("Release_year", 0), errors="coerce") or 0)
+                if year_filter == 2005 and yr <= 2008:
+                    final *= 1.05
+                if year_filter == 2019 and yr >= 2018:
+                    final *= 1.05
 
             final = float(np.clip(final, 0.0, 1.0))
             out.append((idx, final))
@@ -275,11 +330,12 @@ class CorrectAnimeRecommender:
         diverse = []
 
         for idx, score in reranked:
-            title = str(self.df.iloc[idx].get("title", "")).lower()
+            title = str(self.df.iloc[idx].get("Name", "")).lower()
             root = re.split(r":|-", title)[0].strip()
             main_genre = (self.df.iloc[idx].get("genre_list") or ["Unknown"])[0]
 
-            if root in seen_titles:
+            # Only remove low-quality duplicates
+            if root in seen_titles and score < 0.75:
                 continue
             if detected_genres:
                 # allow same genre if user requested
@@ -314,7 +370,7 @@ class CorrectAnimeRecommender:
 
         # compute mean embedding for clicked items if available
         emb_vec = None
-        if len(user_a) >= 2:
+        if len(user_a) >= 2 and self.embeddings is not None:
             vecs = [self.embeddings[i] for i in user_a if i < len(self.embeddings)]
             if vecs:
                 v = np.mean(vecs, axis=0)
@@ -323,14 +379,15 @@ class CorrectAnimeRecommender:
                     emb_vec = v / n
 
         for idx, score in reranked:
-            add = 0.0
+            boost = 1.0
             row_genres = [g.lower() for g in self.df.iloc[idx].get("genre_list", [])]
             if any(g in user_g for g in row_genres):
-                add += 0.05
+                boost *= 1.05
             if emb_vec is not None and idx < len(self.embeddings):
-                add += 0.03 * float(np.dot(emb_vec, self.embeddings[idx]))
+                sim = float(np.dot(emb_vec, self.embeddings[idx]))
+                boost *= (1.0 + 0.03 * sim)
 
-            new_score = float(np.clip(score + add, 0.0, 1.0))
+            new_score = float(np.clip(score * boost, 0.0, 1.0))
             personalized.append((idx, new_score))
 
         personalized.sort(key=lambda x: x[1], reverse=True)
@@ -356,8 +413,24 @@ class CorrectAnimeRecommender:
             self.query_cache[cache_key] = qvec
             if len(self.query_cache) > self.MAX_CACHE:
                 self.query_cache.popitem(last=False)
+        
+        # Hyper-personalization: adaptive blend based on user history size
+        if user_id and user_id in self.user_history and self.embeddings is not None:
+            liked = self.user_history[user_id]["anime"]
+            if len(liked) >= 2:
+                vecs = [self.embeddings[i] for i in liked if i < len(self.embeddings)]
+                if vecs:
+                    user_vec = np.mean(vecs, axis=0)
+                    user_vec_norm = np.linalg.norm(user_vec)
+                    if user_vec_norm > 0:
+                        user_vec = user_vec / user_vec_norm
+                        # Adaptive blending: stronger with more history
+                        alpha = min(0.45, 0.15 + 0.05 * len(liked))
+                        qvec = (1 - alpha) * qvec + alpha * user_vec
+                        # Re-normalize
+                        qvec = qvec / np.linalg.norm(qvec)
 
-        candidates_k = max(200, k * 10)
+        candidates_k = max(250, k * 12)
         sims, idxs = self._search_pinecone(qvec, candidates_k)
         if sims.size == 0:
             return []
@@ -380,7 +453,7 @@ class CorrectAnimeRecommender:
                 "type": str(row.get("Type", "")),
                 "studio": str(row.get("Studio", "")),
                 "mood_tags": list(row.get("mood_tags") or []),
-                "description": str(row.get("Description", ""))[:200]
+                "description": str(row.get("Description", ""))[:350]
             })
 
         # stats

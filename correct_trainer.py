@@ -56,7 +56,8 @@ class CorrectAnimeTrainer:
     def parse_categories(self, s):
         if pd.isna(s) or not s:
             return []
-        return [p.strip() for p in str(s).split(",") if p.strip()]
+        import re
+        return [p.strip().lower() for p in re.split(r",|;", str(s)) if p.strip()]
 
     def extract_mood(self, text: str):
         if not isinstance(text, str) or not text:
@@ -134,6 +135,9 @@ class CorrectAnimeTrainer:
             0.6 * (df["Rating"].fillna(3.5) / 5.0) +
             0.4 * (1 - (df["log_rank"] / max_log_rank))
         )
+        
+        # Clamp quality_score to [0.0, 1.0]
+        df["quality_score"] = df["quality_score"].clip(0.0, 1.0)
 
         self.df = df
         return df
@@ -152,7 +156,7 @@ class CorrectAnimeTrainer:
             return
         
         logger.info("Uploading embeddings to Pinecone...")
-        batch_size = 100
+        batch_size = 200
         vectors = []
         
         for idx in range(len(embeddings)):
@@ -187,7 +191,7 @@ class CorrectAnimeTrainer:
 
     def create_tfidf(self) -> Tuple[object, np.ndarray]:
         tf = TfidfVectorizer(
-            max_features=1000, stop_words="english", ngram_range=(1, 2), min_df=2
+            max_features=3000, stop_words="english", ngram_range=(1, 2), min_df=2
         )
         mat = tf.fit_transform(self.df["semantic_text"]).toarray()
 
